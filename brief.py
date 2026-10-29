@@ -10,6 +10,19 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.path.join(HERE, "config.json")))
+
+
+def merge(base, over):
+    """Overlay over onto base in place; nested dicts merge key by key."""
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+
+
+if os.path.exists(os.path.join(HERE, "settings.json")):  # tuning dials kept in the Claude Project
+    merge(CFG, json.load(open(os.path.join(HERE, "settings.json"))))
 ET, NZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Pacific/Auckland"), dt.timezone.utc
 SLEEPER, SLEEPER2 = "https://api.sleeper.app/v1/", "https://api.sleeper.com/"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"

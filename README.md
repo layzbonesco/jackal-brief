@@ -8,6 +8,7 @@ It never changes anything in Sleeper: locks, lineups, adds and trades are done b
 - **Code** (this repo, `layzbonesco/jackal-brief`): `brief.py`, `config.json`, `README.md`.
 - **State** (claude.ai Project "Sleeper", folder `jackal-brief/`): `locks.json` (scores Asher has locked, keyed by the Monday of the US week),
   `overrides.json` (manual injury calls), `docs.json` (the link to each week's brief doc).
+- **Tuning** (same Project folder): optional `settings.json` next to `brief.py` overrides values in `config.json` (nested sections like `dnp` merge key by key), so changing a tuning dial doesn't need a code change.
 
 ## Usage
 ```
