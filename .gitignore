@@ -1,0 +1,6 @@
+cache/
+out*/
+__pycache__/
+locks.json
+overrides.json
+settings.json

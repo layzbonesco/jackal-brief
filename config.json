@@ -1,0 +1,27 @@
+{
+  "league_id": "1407696869110358016",
+  "my_display_name": "iAshy",
+  "season": "2026",
+  "cache_dir": "cache",
+  "prior_weight_games": 5,
+  "prior_min_gp": 10,
+  "baseline_fp": 12.0,
+  "min_sd": 5.0,
+  "sd_ratio": 0.28,
+  "close_call_fp": 2.0,
+  "min_lineup_gain": 2.0,
+  "min_fa_gain": 2.0,
+  "min_avg_minutes_fa": 18,
+  "min_games_fa": 2,
+  "fa_prior_floor": 22,
+  "dnp": {
+    "default": 0.05,
+    "out_next": 0.95,
+    "out_later": 0.6,
+    "out_long": 0.95,
+    "long_words": ["expected to miss", "indefinitely", "weeks", "season", "surgery", "extended"],
+    "espn": {"day-to-day": 0.3, "questionable": 0.4, "doubtful": 0.75, "probable": 0.1},
+    "sleeper": {"Out": 0.9, "IR": 1.0, "Sus": 1.0, "Doubtful": 0.75, "GTD": 0.35, "DTD": 0.3, "Questionable": 0.4, "Probable": 0.1}
+  },
+  "espn_to_sleeper_team": {"GS": "GSW", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS", "NO": "NOP"}
+}
