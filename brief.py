@@ -5,7 +5,7 @@ Data:  Sleeper (league, rosters, matchups, players, weekly game stats, last seas
        ESPN (scoreboard for tip times / live state, injuries feed)
 Usage: python3 brief.py [--now 2026-10-29T20:00:00Z] [--out DIR] [--league] [--trades] [--selftest]
 """
-import argparse, collections, datetime as dt, json, math, os, re, sys, time, unicodedata, urllib.request
+import argparse, collections, datetime as dt, json, math, os, random, re, sys, time, unicodedata, urllib.request
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -105,8 +105,75 @@ def pass_value(mu, sd, dnps):
     return v
 
 
+def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, max_open=8):
+    """Monte Carlo chance of finishing above opp_total, and the lock/pass calls that maximise it.
+
+    entries: open starters, each dict(name, s0, mu, sd, dnps, ev_lock):
+      s0       latest lockable score this week (None if there is nothing to lock yet)
+      dnps     miss chance for each remaining game, in order
+      ev_lock  whether the points rule (lock if s0 >= value of passing) says lock now
+    fixed: points already banked (locked slots, plus forced locks with no games left).
+    A player who passes follows the points rule for his later games; his last game is always locked
+    (an unlocked starter scores 0). Every lock/pass combination is scored on the same simulated weeks,
+    so differences between combinations are not noise. Ties count half."""
+    rnd = random.Random(seed)
+
+    def pass_path(e):
+        d = e["dnps"]
+        th = [pass_value(e["mu"], e["sd"], d[i + 1:]) for i in range(len(d))]
+        out = []
+        for _ in range(n):
+            res = 0.0
+            for i, p in enumerate(d):
+                g = 0.0 if rnd.random() < p else max(0.0, rnd.gauss(e["mu"], e["sd"]))
+                if i == len(d) - 1 or g >= th[i]:
+                    res = g
+                    break
+            out.append(res)
+        return out
+
+    for e in entries:
+        e["path"] = pass_path(e)
+        e["pv"] = pass_value(e["mu"], e["sd"], e["dnps"])
+    choosable = sorted([e for e in entries if e["s0"] is not None], key=lambda e: abs(e["s0"] - e["pv"]))
+    var, rest = choosable[:max_open], [e for e in entries if e not in choosable[:max_open]]
+    base = [fixed] * n
+    for e in rest:
+        if e["s0"] is not None and e["ev_lock"]:
+            base = [b + e["s0"] for b in base]
+        else:
+            base = [b + x for b, x in zip(base, e["path"])]
+    for e in var:
+        base = [b + x for b, x in zip(base, e["path"])]
+    deltas = [[e["s0"] - x for x in e["path"]] for e in var]
+
+    def pwin(arr):
+        return sum(1.0 if t > opp_total else (0.5 if t == opp_total else 0.0) for t in arr) / n
+
+    k = len(var)
+    score = {}
+
+    def rec(j, arr, mask):
+        if j == k:
+            score[mask] = pwin(arr)
+            return
+        rec(j + 1, arr, mask)
+        rec(j + 1, [a + d for a, d in zip(arr, deltas[j])], mask | (1 << j))
+
+    rec(0, base, 0)
+    ev_mask = sum(1 << j for j, e in enumerate(var) if e["ev_lock"])
+    top = max(score.values())
+    # among combinations within simulation noise of the best, prefer the one closest to the points rule
+    # (so ties never lock more players than needed)
+    best_mask = min((m for m in score if score[m] >= top - 0.002), key=lambda m: (bin(m ^ ev_mask).count("1"), -score[m]))
+    if score[best_mask] - score[ev_mask] < min_gain:
+        best_mask = ev_mask  # not worth departing from the points rule on a gain this small
+    return dict(p_ev=score[ev_mask], p_best=score[best_mask], p_all=score[(1 << k) - 1], n=n, k=k,
+                calls={e["name"]: bool(best_mask >> j & 1) for j, e in enumerate(var)},
+                ev={e["name"]: e["ev_lock"] for e in var}, skipped=len(choosable) - k)
+
+
 def selftest():
-    import random
     r = random.Random(1)
     mu, sd, p = 25.0, 7.0, 0.07
     g = lambda: 0.0 if r.random() < p else max(0.0, r.gauss(mu, sd))
@@ -116,7 +183,17 @@ def selftest():
     ana = pass_value(mu, sd, [p, p])
     ok = abs(sim - ana) < 0.15
     print(f"selftest: 2 games left mu 25 sd 7 -> simulated {sim:.2f}, analytic {ana:.2f}: {'OK' if ok else 'FAIL'}")
-    return ok
+    # win probability: one forced game vs an opponent sitting at the player's mean -> about 50%
+    e = dict(name="x", s0=None, mu=20.0, sd=5.0, dnps=[0.0], ev_lock=False)
+    w = win_probability([e], 0.0, 20.0, n=40000)
+    ok2 = abs(w["p_best"] - 0.5) < 0.02
+    print(f"selftest: win chance with one game vs the mean -> {w['p_best']:.3f} (want about 0.5): {'OK' if ok2 else 'FAIL'}")
+    # a lockable 30 against an opponent on 29 with 2 weak games left: locking must beat passing
+    e = dict(name="y", s0=30.0, mu=12.0, sd=4.0, dnps=[0.05, 0.05], ev_lock=True)
+    w = win_probability([e], 0.0, 29.0, n=20000)
+    ok3 = w["calls"]["y"] and w["p_best"] > 0.99
+    print(f"selftest: lock a 30 vs 29 with weak games left -> lock={w['calls']['y']}, win {w['p_best']:.3f}: {'OK' if ok3 else 'FAIL'}")
+    return ok and ok2 and ok3
 
 
 # ---------------- lineup assignment (Hungarian, min cost) ----------------
@@ -441,6 +518,45 @@ def main():
     for u in [u for u in ups if not u["waiver"]][:1]:
         if u["gain"] >= CFG["min_fa_gain"]:
             actions.append(("9998", f"Consider adding {u['add']} ({u['pos']}, {u['team']}) for {u['drop']}: +{u['gain']:.1f} this week"))
+    # ---- win probability against this week's opponent
+    wp = None
+    opp_m = next((m for m in matchups if mm and m["matchup_id"] == mm.get("matchup_id") and m["roster_id"] != mine["roster_id"]), None)
+    if opp_m:
+        opp_name = owner[opp_m["roster_id"]]
+        ov_total = (CFG.get("opponent_total") or {}).get(wk_start.isoformat())
+        opp_total = float(ov_total) if ov_total is not None else float(opp_m.get("points") or 0)
+        fixed, entries = 0.0, []
+        for pid in starters:
+            if pid not in me:
+                continue
+            r = me[pid]
+            n_left, lk = len(r["games"]), r["lock"]
+            if pid in locked_pids:
+                fixed += LOCKS[r["name"]]["score"]
+            elif lk and n_left == 0:
+                fixed += lk["fp"]
+            elif n_left:
+                entries.append(dict(name=r["name"], s0=lk["fp"] if lk else None, mu=r["mu"], sd=r["sd"], dnps=r["dnps"],
+                                    ev_lock=bool(lk and lk["fp"] >= r["pass_value"]), next_utc=r["next_utc"], next_tip=r["next_tip"]))
+        wp = win_probability(entries, fixed, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"],
+                             max_open=CFG["winprob_max_open"])
+        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json override" if ov_total is not None else "Sleeper matchup points",
+                  fixed=fixed, mine_now=mm.get("points") or 0.0,
+                  opp_open=[nm(p) for p in (next((r_ for r_ in rosters if r_["roster_id"] == opp_m["roster_id"]), {}).get("starters") or [])
+                            if p in P and [g for g in future.get(team_of(p), []) if g["day"] <= wk_end.isoformat()]])
+        if CFG.get("objective") == "win":
+            gain = wp["p_best"] - wp["p_ev"]
+            for row in lock_rows:
+                c = wp["calls"].get(row["name"])
+                if c is None or c == (row["call"] == "LOCK"):
+                    continue
+                row["call"] = "LOCK" if c else "PASS"
+                row["why"] = f"win mode: {wp['p_ev']:.0%} to {wp['p_best']:.0%} win chance (points rule said {'lock' if c is False else 'pass'})"
+                actions[:] = [a for a in actions if not a[1].startswith(f"LOCK {row['name']} (")]
+                if c:
+                    nxt = next(e for e in entries if e["name"] == row["name"])
+                    actions.append((nxt["next_utc"], f"LOCK {row['name']} ({row['score']:.1f}) before his next tip ({nxt['next_tip']} NZ): "
+                                                     f"win mode, lifts win chance vs {opp_name} from {wp['p_ev']:.0%} to {wp['p_best']:.0%}"))
     actions.sort(key=lambda x: x[0])
 
     rec = {r["roster_id"]: (r["settings"]["wins"], r["settings"]["losses"]) for r in rosters}
@@ -590,6 +706,20 @@ def main():
     o += ["", "## Matchup"]
     if mm and opp:
         o.append(f"Me {mm.get('points', 0):.1f} vs {owner[opp['roster_id']]} {opp.get('points', 0):.1f}")
+    if wp:
+        o += ["", f"## Win probability vs {wp['opp']} (to beat {wp['opp_total']:.1f}; source: {wp['source']})",
+              f"Banked {wp['fixed']:.1f} in locked slots; {len(wp['calls']) + wp['skipped']} open starters simulated, {wp['n']} weeks.",
+              f"- Points rule calls: {wp['p_ev']:.1%}",
+              f"- Best calls ({'in use' if CFG.get('objective') == 'win' else 'shown only; objective is points'}): {wp['p_best']:.1%}",
+              f"- Lock everything lockable now: {wp['p_all']:.1%}"]
+        if wp["calls"]:
+            o += ["", "| Player | Points rule | Win-chance call |", "|---|---|---|"]
+            for n_, c in wp["calls"].items():
+                o.append(f"| {n_} | {'LOCK' if wp['ev'][n_] else 'PASS'} | **{'LOCK' if c else 'PASS'}**{'' if c == wp['ev'][n_] else ' (differs)'} |")
+        if wp["opp_open"] and CFG.get("opponent_total", {}).get(wk_start.isoformat()) is None:
+            o.append(f"- Assumes {wp['opp']}'s total is final. {len(wp['opp_open'])} of his starters still have games left "
+                     f"({', '.join(wp['opp_open'][:5])}); if they aren't locked his total can move. Set opponent_total in settings.json to the figure your app shows.")
+        o.append("- Uses your current starters; lineup swaps above are not simulated.")
     if WARN:
         o += ["", "## Data warnings"] + [f"- {w}" for w in WARN]
     o += ["", f"_Model: per-game mean blends last season's FP/game (weight {CFG['prior_weight_games']} games) with this season's games; "

@@ -33,6 +33,14 @@ Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from 
 - **Miss chance per game**: overrides.json first, then the ESPN injuries feed (Out / Day-To-Day / Questionable...; "expected to miss time" means every game this week), then Sleeper's status, else 5%.
 - **Lock threshold** = value of passing, by optimal stopping over the remaining games: work back from the last game (which you'd always lock, since unlocked = 0).
   Lock if the score is at least that value. Calls within 2 points are marked close.
+- **Win probability** (`objective: "win"`, the default): against this week's opponent only the win matters, not the points. For every starter with a lockable score,
+  the brief simulates the rest of the week (12,000 weeks) with that score locked now and passed, for every combination of locks, on the same simulated weeks.
+  The calls that give the best chance of beating the opponent's total are used; the points rule is shown beside them, and the best combination is only used when it beats the
+  points rule by at least `winprob_min_gain` (0.5 points of win chance). Ties between combinations go to the one closest to the points rule, so it never locks more than needed.
+  Set `"objective": "points"` in settings.json to keep the old calls (the win section still shows).
+  The opponent's total is Sleeper's matchup points unless settings.json has `"opponent_total": {"<Monday of the week>": <number>}`, e.g. `{"2026-10-26": 149}`.
+  The brief can't see which of the opponent's players are locked, so it assumes his total is final and warns when he still has starters with games left.
+  It uses your current starters; suggested lineup swaps are not simulated.
 - **Lineup**: locked starters and players whose game is live are frozen; the best layout of the open slots is found by assignment. Changes under 2 points are shown as optional.
 - **Free agents**: active, not rostered, 2+ games at 18+ minutes or last season 22+ FP/game. Gain = lineup value with him in place of one of the 4 weakest bench players.
   "waiver" = his team already played today, so the add is probably a waiver claim.
