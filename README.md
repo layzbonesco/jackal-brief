@@ -38,8 +38,9 @@ Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from 
   The calls that give the best chance of beating the opponent's total are used; the points rule is shown beside them, and the best combination is only used when it beats the
   points rule by at least `winprob_min_gain` (0.5 points of win chance). Ties between combinations go to the one closest to the points rule, so it never locks more than needed.
   Set `"objective": "points"` in settings.json to keep the old calls (the win section still shows).
-  The opponent's total is Sleeper's matchup points unless settings.json has `"opponent_total": {"<Monday of the week>": <number>}`, e.g. `{"2026-10-26": 149}`.
-  The brief can't see which of the opponent's players are locked, so it assumes his total is final and warns when he still has starters with games left.
+  The opponent's locked total must be set each week in settings.json as `"opponent_total": {"<Monday of the week>": <number>}`, e.g. `{"2026-10-26": 149}`.
+  Sleeper's matchup points can't be used: they add up each starter's latest game, not what was locked. Without it, win mode is off for the week
+  (the lock calls use the points rule) and "Do now" says what to add.
   It uses your current starters; suggested lineup swaps are not simulated.
 - **Lineup**: locked starters and players whose game is live are frozen; the best layout of the open slots is found by assignment. Changes under 2 points are shown as optional.
 - **Free agents**: active, not rostered, 2+ games at 18+ minutes or last season 22+ FP/game. Gain = lineup value with him in place of one of the 4 weakest bench players.

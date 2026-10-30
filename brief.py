@@ -521,10 +521,15 @@ def main():
     # ---- win probability against this week's opponent
     wp = None
     opp_m = next((m for m in matchups if mm and m["matchup_id"] == mm.get("matchup_id") and m["roster_id"] != mine["roster_id"]), None)
-    if opp_m:
+    ov_total = (CFG.get("opponent_total") or {}).get(wk_start.isoformat())
+    if opp_m and ov_total is None:
+        # Sleeper's matchup points are each starter's latest game added up, not what he locked, so they can't stand in for his total
+        wp = dict(opp=owner[opp_m["roster_id"]], missing=True, sleeper_pts=float(opp_m.get("points") or 0))
+        actions.append(("0000", f"Win mode is off: add \"opponent_total\": {{\"{wk_start}\": <{wp['opp']}'s locked total>}} to settings.json "
+                                f"(Sleeper's {wp['sleeper_pts']:.1f} is his latest games, not his locks)"))
+    elif opp_m:
         opp_name = owner[opp_m["roster_id"]]
-        ov_total = (CFG.get("opponent_total") or {}).get(wk_start.isoformat())
-        opp_total = float(ov_total) if ov_total is not None else float(opp_m.get("points") or 0)
+        opp_total = float(ov_total)
         fixed, entries = 0.0, []
         for pid in starters:
             if pid not in me:
@@ -540,10 +545,7 @@ def main():
                                     ev_lock=bool(lk and lk["fp"] >= r["pass_value"]), next_utc=r["next_utc"], next_tip=r["next_tip"]))
         wp = win_probability(entries, fixed, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"],
                              max_open=CFG["winprob_max_open"])
-        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json override" if ov_total is not None else "Sleeper matchup points",
-                  fixed=fixed, mine_now=mm.get("points") or 0.0,
-                  opp_open=[nm(p) for p in (next((r_ for r_ in rosters if r_["roster_id"] == opp_m["roster_id"]), {}).get("starters") or [])
-                            if p in P and [g for g in future.get(team_of(p), []) if g["day"] <= wk_end.isoformat()]])
+        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json", fixed=fixed, mine_now=mm.get("points") or 0.0)
         if CFG.get("objective") == "win":
             gain = wp["p_best"] - wp["p_ev"]
             for row in lock_rows:
@@ -706,7 +708,12 @@ def main():
     o += ["", "## Matchup"]
     if mm and opp:
         o.append(f"Me {mm.get('points', 0):.1f} vs {owner[opp['roster_id']]} {opp.get('points', 0):.1f}")
-    if wp:
+    if wp and wp.get("missing"):
+        o += ["", f"## Win probability vs {wp['opp']}: off this week",
+              f"Needs {wp['opp']}'s locked total. Sleeper's matchup points ({wp['sleeper_pts']:.1f}) add up each of his starters' latest game, "
+              "not what he locked, so they can't be used.",
+              f"Add `\"opponent_total\": {{\"{wk_start}\": <his total>}}` to settings.json; until then the lock calls use the points rule."]
+    elif wp:
         o += ["", f"## Win probability vs {wp['opp']} (to beat {wp['opp_total']:.1f}; source: {wp['source']})",
               f"Banked {wp['fixed']:.1f} in locked slots; {len(wp['calls']) + wp['skipped']} open starters simulated, {wp['n']} weeks.",
               f"- Points rule calls: {wp['p_ev']:.1%}",
@@ -716,9 +723,6 @@ def main():
             o += ["", "| Player | Points rule | Win-chance call |", "|---|---|---|"]
             for n_, c in wp["calls"].items():
                 o.append(f"| {n_} | {'LOCK' if wp['ev'][n_] else 'PASS'} | **{'LOCK' if c else 'PASS'}**{'' if c == wp['ev'][n_] else ' (differs)'} |")
-        if wp["opp_open"] and CFG.get("opponent_total", {}).get(wk_start.isoformat()) is None:
-            o.append(f"- Assumes {wp['opp']}'s total is final. {len(wp['opp_open'])} of his starters still have games left "
-                     f"({', '.join(wp['opp_open'][:5])}); if they aren't locked his total can move. Set opponent_total in settings.json to the figure your app shows.")
         o.append("- Uses your current starters; lineup swaps above are not simulated.")
     if WARN:
         o += ["", "## Data warnings"] + [f"- {w}" for w in WARN]
