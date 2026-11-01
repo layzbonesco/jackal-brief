@@ -99,14 +99,14 @@ def e_max(c, mu, sd, p_dnp):
 
 def pass_value(mu, sd, dnps):
     """Value of NOT locking now, given the remaining games' DNP chances in order.
-    Optimal stopping: an unlocked starter scores 0 at week's end, so the last game is always locked."""
+    Optimal stopping: an unlocked starter's last game counts at week's end, so the last game is always "locked"."""
     v = 0.0
     for p in reversed(dnps):
         v = e_max(v, mu, sd, p)
     return v
 
 
-def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, max_open=8):
+def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, max_open=8, opp_entries=()):
     """Monte Carlo chance of finishing above opp_total, and the lock/pass calls that maximise it.
 
     entries: open starters, each dict(name, s0, mu, sd, dnps, ev_lock):
@@ -114,8 +114,10 @@ def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, 
       dnps     miss chance for each remaining game, in order
       ev_lock  whether the points rule (lock if s0 >= value of passing) says lock now
     fixed: points already banked (locked slots, plus forced locks with no games left).
+    opp_entries: the opponent's unlocked starters (same fields); each is simulated on the points rule and added
+    to opp_total, so opp_total is his banked total, not his final one.
     A player who passes follows the points rule for his later games; his last game is always locked
-    (an unlocked starter scores 0). Every lock/pass combination is scored on the same simulated weeks,
+    (Sleeper counts it if he's left unlocked). Every lock/pass combination is scored on the same simulated weeks,
     so differences between combinations are not noise. Ties count half."""
     rnd = random.Random(seed)
 
@@ -136,6 +138,13 @@ def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, 
     for e in entries:
         e["path"] = pass_path(e)
         e["pv"] = pass_value(e["mu"], e["sd"], e["dnps"])
+    opp = [float(opp_total)] * n  # drawn after my paths, so adding the opponent never changes my simulated games
+    for e in opp_entries:
+        pv = pass_value(e["mu"], e["sd"], e["dnps"]) if e["dnps"] else 0.0
+        if e["s0"] is not None and (not e["dnps"] or e["s0"] >= pv):
+            opp = [o + e["s0"] for o in opp]
+        elif e["dnps"]:
+            opp = [o + x for o, x in zip(opp, pass_path(e))]
     choosable = sorted([e for e in entries if e["s0"] is not None], key=lambda e: abs(e["s0"] - e["pv"]))
     var, rest = choosable[:max_open], [e for e in entries if e not in choosable[:max_open]]
     base = [fixed] * n
@@ -149,7 +158,7 @@ def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, 
     deltas = [[e["s0"] - x for x in e["path"]] for e in var]
 
     def pwin(arr):
-        return sum(1.0 if t > opp_total else (0.5 if t == opp_total else 0.0) for t in arr) / n
+        return sum(1.0 if t > o else (0.5 if t == o else 0.0) for t, o in zip(arr, opp)) / n
 
     k = len(var)
     score = {}
@@ -170,6 +179,7 @@ def win_probability(entries, fixed, opp_total, n=12000, seed=7, min_gain=0.005, 
     if score[best_mask] - score[ev_mask] < min_gain:
         best_mask = ev_mask  # not worth departing from the points rule on a gain this small
     return dict(p_ev=score[ev_mask], p_best=score[best_mask], p_all=score[(1 << k) - 1], n=n, k=k,
+                opp_mean=sum(opp) / n,
                 calls={e["name"]: bool(best_mask >> j & 1) for j, e in enumerate(var)},
                 ev={e["name"]: e["ev_lock"] for e in var}, skipped=len(choosable) - k)
 
@@ -194,7 +204,14 @@ def selftest():
     w = win_probability([e], 0.0, 29.0, n=20000)
     ok3 = w["calls"]["y"] and w["p_best"] > 0.99
     print(f"selftest: lock a 30 vs 29 with weak games left -> lock={w['calls']['y']}, win {w['p_best']:.3f}: {'OK' if ok3 else 'FAIL'}")
-    return ok and ok2 and ok3
+    # opponent with an open starter: my 120 banked vs his 100 + one game of mean 20 -> about 50%, and his
+    # open game must lower my chance compared with treating his 100 as final
+    e = dict(name="o", s0=None, mu=20.0, sd=5.0, dnps=[0.0])
+    w = win_probability([], 120.0, 100.0, n=40000, opp_entries=[e])
+    ok4 = abs(w["p_best"] - 0.5) < 0.02 and abs(w["opp_mean"] - 120.0) < 0.3
+    print(f"selftest: opponent open starter -> win {w['p_best']:.3f} (want about 0.5), his expected final {w['opp_mean']:.1f}: "
+          f"{'OK' if ok4 else 'FAIL'}")
+    return ok and ok2 and ok3 and ok4
 
 
 # ---------------- lineup assignment (Hungarian, min cost) ----------------
@@ -266,6 +283,7 @@ def main():
     ap.add_argument("--league", action="store_true")
     ap.add_argument("--trades", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--review", nargs="?", const="last", help="scorecard for a past week (Monday US date, default last week)")
     ap.add_argument("--out", default=os.path.join(HERE, "out"))
     args = ap.parse_args()
     if args.selftest:
@@ -410,7 +428,7 @@ def main():
     def team_of(pid):
         return P.get(pid, {}).get("team")
 
-    def player(pid, starter=False):
+    def player(pid, starter=False, check_slot=None):
         team = team_of(pid)
         games = [g for g in future.get(team, []) if g["day"] <= wk_end.isoformat()]
         mu, sd, n, pm = model(pid)
@@ -419,7 +437,9 @@ def main():
         wk = [g for g in glog.get(pid, []) if g["date"] in wk_days]
         lockable = wk[-1] if (starter and wk and team not in live) else None
         slot_seen, bench_game = None, None
-        if lockable:
+        if check_slot is None:
+            check_slot = pid in (mine["players"] or [])  # snapshots only know my lineup
+        if lockable and check_slot:
             slot_seen, why_seen = slot_status(pid, lockable)
             if slot_seen == "bench":
                 lockable, bench_game = None, dict(wk[-1], why=why_seen)
@@ -471,7 +491,9 @@ def main():
     sl_pts = mm.get("players_points") or {}
 
     lp = os.path.join(HERE, "locks.json")
-    LOCKS = (json.load(open(lp)) if os.path.exists(lp) else {}).get(wk_start.isoformat(), {})
+    ALL_LOCKS = json.load(open(lp)) if os.path.exists(lp) else {}
+    canon = {norm(nm(p)): nm(p) for p in set(mine["players"] or []) | set(mm.get("starters") or []) if p in P}
+    LOCKS = {canon.get(norm(k), k): v for k, v in ALL_LOCKS.get(wk_start.isoformat(), {}).items()}
     locked_pids = {pid for pid in starters if pid in me and me[pid]["name"] in LOCKS}
     # A lock stays with the roster after the player is traded or dropped (Sleeper shows the slot as "0").
     # Match those locks to their slot: Sleeper's matchup starters still name the player, else the slot in locks.json.
@@ -489,6 +511,11 @@ def main():
             lock_slot[i] = hit
     unmatched = [n for n in gone if n not in lock_slot.values()]
     banked = sum(float(v["score"]) for v in LOCKS.values())
+
+    # Sleeper's rule for a starter left unlocked at week's end (Lock-In Mode Details, Sleeper HQ, Feb 2026): "Sleeper will take
+    # the fantasy points scored in his team's final game of the week", 0 if he didn't play. "zero" is kept as an option.
+    # The lock math is the same either way (the last game counts); only the warnings differ.
+    AUTO_LAST = CFG.get("unlocked_rule", "last_game") == "last_game"
 
     # lock calls
     lock_rows, actions = [], []
@@ -518,7 +545,9 @@ def main():
             if note:
                 actions.append(("0001", f"Was {r['name']} in your starting lineup when he scored {s:.1f} ({lk['date']} US)? "
                                         f"Bench games can't be locked. Tell Claude so lineup.json records it"))
-            if n_left == 0:
+            if n_left == 0 and AUTO_LAST:
+                call, why = "LOCK", "no games left: this game counts automatically"
+            elif n_left == 0:
                 call, why = "LOCK", "no games left: unlocked scores 0"
                 actions.append((week_close.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ"),
                                 f"LOCK {r['name']} ({s:.1f}) now: no games left, unlocked = 0 (week closes {nz(week_close)} NZ)"+note))
@@ -531,7 +560,7 @@ def main():
                     why += " (close call)"
             lock_rows.append(dict(name=r["name"], score=s, sleeper=sl_pts.get(pid), left=n_left, next_tip=r["next_tip"],
                                   threshold=pv, call=call, why=why + (" (slot unknown: only if he was starting)" if note else ""), avg=r["mu"]))
-        elif n_left == 1 and not r["live"]:
+        elif n_left == 1 and not r["live"] and not AUTO_LAST:
             actions.append((r["next_utc"], f"{r['name']}: his {r['next_tip']} NZ game is his last this week; lock it once it finishes (unlocked = 0)"))
         elif n_left == 0 and not lk:
             actions.append(("0000", f"{r['name']} has no lockable game and no games left: 0 this week unless swapped (slot {slots[i]})"))
@@ -604,11 +633,33 @@ def main():
     if opp_m and ov_total is None:
         # Sleeper's matchup points are each starter's latest game added up, not what he locked, so they can't stand in for his total
         wp = dict(opp=owner[opp_m["roster_id"]], missing=True, sleeper_pts=float(opp_m.get("points") or 0))
-        actions.append(("0000", f"Win mode is off: what is {wp['opp']}'s locked total right now? It goes in settings.json as "
-                                f"\"opponent_total\": {{\"{wk_start}\": <total>}} (Sleeper's {wp['sleeper_pts']:.1f} is his latest games, not his locks)"))
+        actions.append(("0000", f"Win mode is off: what is {wp['opp']}'s locked total right now, and which of his starters are still unlocked? "
+                                f"They go in settings.json as \"opponent_total\": {{\"{wk_start}\": <total>}} and \"opponent_open\": {{\"{wk_start}\": [<names>]}} "
+                                f"(Sleeper's {wp['sleeper_pts']:.1f} is his latest games, not his locks)"))
     elif opp_m:
         opp_name = owner[opp_m["roster_id"]]
         opp_total = float(ov_total)
+        # his unlocked starters: Asher lists them (settings.json opponent_open); each is simulated like mine
+        opp_open = (CFG.get("opponent_open") or {}).get(wk_start.isoformat())
+        opp_entries, opp_unknown, opp_named = [], [], []
+        if opp_open is None:
+            actions.append(("0000", f"Which of {opp_name}'s starters are still unlocked? Add \"opponent_open\": {{\"{wk_start}\": [<names>]}} "
+                                    f"to settings.json ([] if he's fully locked). Until then his {opp_total:.1f} is treated as final, "
+                                    "so the win chance is too high if he still has open starters"))
+        else:
+            opp_r = next(r for r in rosters if r["roster_id"] == opp_m["roster_id"])
+            by_name = {norm(nm(p)): p for p in (opp_r["players"] or []) if p in P}
+            for name_ in opp_open:
+                pid = by_name.get(norm(name_))
+                if not pid:
+                    opp_unknown.append(name_)
+                    continue
+                r = player(pid, starter=True, check_slot=False)
+                opp_named.append(r["name"])
+                if r["games"] or r["lock"]:
+                    opp_entries.append(dict(name=r["name"], s0=r["lock"]["fp"] if r["lock"] else None, mu=r["mu"], sd=r["sd"], dnps=r["dnps"]))
+            if opp_unknown:
+                actions.append(("0000", f"opponent_open lists {', '.join(opp_unknown)}, not found on {opp_name}'s roster: check the spelling"))
         def week_setup(lineup):
             """Banked points and open entries for a lineup (one pid per slot). Every lock in locks.json counts,
             even for players since traded or dropped; a player moved in from the bench has no lockable game."""
@@ -628,15 +679,17 @@ def main():
 
         fixed, entries = week_setup(starters)
         wp = win_probability(entries, fixed, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"],
-                             max_open=CFG["winprob_max_open"])
+                             max_open=CFG["winprob_max_open"], opp_entries=opp_entries)
         # the same week on the suggested lineup (open slots filled as the lineup section recommends)
         best_lu = [target.get(i, starters[i]) if i in open_slots else starters[i] for i in range(len(slots))]
         wp_lineup = None
         if best_lu != starters:
             f2, e2 = week_setup(best_lu)
-            wl = win_probability(e2, f2, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"], max_open=CFG["winprob_max_open"])
+            wl = win_probability(e2, f2, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"], max_open=CFG["winprob_max_open"],
+                                 opp_entries=opp_entries)
             wp_lineup = dict(p=wl["p_best"], moves=moves)
-        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json", fixed=fixed, mine_now=mm.get("points") or 0.0, lineup=wp_lineup)
+        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json", fixed=fixed, mine_now=mm.get("points") or 0.0, lineup=wp_lineup,
+                  opp_open=opp_open, opp_named=opp_named)
         if (CFG.get("objective") == "win" and wp_lineup and wp_lineup["p"] < max(wp["p_best"], wp["p_ev"]) - CFG["winprob_min_gain"]
                 and any(t.startswith("Start ") for _, t in actions)):
             actions[:] = [x for x in actions if not x[1].startswith("Start ")]
@@ -705,6 +758,49 @@ def main():
             seen.add((f["owner"], f["get"]))
             n += 1
             print(f"| {f['get']} | {f['owner']} ({f['rec']}) | {' + '.join(f['give'])} | +{f['me']:.1f} | +{f['them']:.1f} |")
+        return
+
+    # ---- weekly scorecard: what was locked vs the best game of the week, and what the brief said at the time
+    if args.review:
+        cp_ = os.path.join(HERE, "calls.json")
+        CALLS = json.load(open(cp_)) if os.path.exists(cp_) else {}
+        rw = (wk_start - dt.timedelta(days=7)) if args.review == "last" else dt.date.fromisoformat(args.review)
+        rdays = [(rw + dt.timedelta(days=i)).isoformat() for i in range(7)]
+        rl = {canon.get(norm(k), k): v for k, v in ALL_LOCKS.get(rw.isoformat(), {}).items()}
+        by_name = {nm(p): p for p in set(mine["players"] or []) | {p for r in rosters for p in (r["players"] or [])} if p in P}
+        runs = CALLS.get(rw.isoformat(), [])
+        print(f"# Scorecard: week of Mon {rw} US\n")
+        if not rl:
+            print("No locks recorded in locks.json for this week, so there is nothing to score.")
+        else:
+            print("| Player | Locked | His games that week | Best game | Left on table | Brief said |\n|---|---|---|---|---|---|")
+            tot_l = tot_b = 0.0
+            for name_, v in sorted(rl.items(), key=lambda x: -float(x[1]["score"])):
+                pid = by_name.get(name_)
+                gl = [g for g in glog.get(pid, []) if g["date"] in rdays] if pid else []
+                best = max([g["fp"] for g in gl] + [float(v["score"])])
+                # the advice on the score he locked, from the last run before it showed as LOCKED
+                said = [c["call"] for r_ in runs for c in r_["calls"]
+                        if c["name"] == name_ and c.get("score") == float(v["score"]) and c["call"] != "LOCKED"]
+                tot_l += float(v["score"]); tot_b += best
+                games_s = ", ".join("%.1f" % g["fp"] for g in gl) or "-"
+                print(f"| {name_} | {float(v['score']):.1f} | {games_s} | {best:.1f} | "
+                      f"{best - float(v['score']):.1f} | {said[-1] if said else 'not logged (locked before a run saw it)'} |")
+            print(f"\nLocked {tot_l:.1f} of a hindsight best {tot_b:.1f} ({tot_l / tot_b:.0%}). Hindsight best uses every game, "
+                  "including bench games that couldn't be locked, so it overstates what was possible.")
+            ot = (CFG.get("opponent_total") or {}).get(rw.isoformat())
+            if ot is not None:
+                print(f"vs {float(ot):.1f} for the opponent (settings.json, as last given).")
+        if runs:
+            ps = [r_["win"] for r_ in runs if r_.get("win") is not None]
+            if ps:
+                print(f"\nWin chance the brief gave: first {ps[0]:.0%}, last {ps[-1]:.0%} ({len(runs)} runs logged).")
+        st_ = mine["settings"]
+        f_ = st_.get("fpts", 0) + st_.get("fpts_decimal", 0) / 100
+        pp_ = st_.get("ppts", 0) + st_.get("ppts_decimal", 0) / 100
+        if pp_:
+            print(f"\nSeason so far (Sleeper): {f_:.1f} scored of {pp_:.1f} possible ({f_ / pp_:.0%}). "
+                  f"Record {st_.get('wins', 0)}-{st_.get('losses', 0)}; waiver position {st_.get('waiver_position', '?')}.")
         return
 
     # ---- league comparison
@@ -822,6 +918,10 @@ def main():
     elif wp:
         o += ["", f"## Win probability vs {wp['opp']} (to beat {wp['opp_total']:.1f}; source: {wp['source']})",
               f"Banked {wp['fixed']:.1f} in locked slots; {len(wp['calls']) + wp['skipped']} open starters simulated, {wp['n']} weeks.",
+              (f"{wp['opp']}: {wp['opp_total']:.1f} banked + {len(wp['opp_named'])} open starter(s) simulated ({', '.join(wp['opp_named'])}); "
+               f"expected final {wp['opp_mean']:.1f}." if wp["opp_named"] else
+               f"{wp['opp']}: {wp['opp_total']:.1f}, treated as final"
+               + (" (fully locked)." if wp["opp_open"] == [] else " (open starters not given: win chance may be too high).")),
               f"- Points rule calls: {wp['p_ev']:.1%}",
               f"- Best calls ({'in use' if CFG.get('objective') == 'win' else 'shown only; objective is points'}): {wp['p_best']:.1%}",
               f"- Lock everything lockable now: {wp['p_all']:.1%}"]
@@ -842,11 +942,22 @@ def main():
     if WARN:
         o += ["", "## Data warnings"] + [f"- {w}" for w in WARN]
     o += ["", f"_Model: per-game mean blends last season's FP/game (weight {CFG['prior_weight_games']} games) with this season's games; "
-               "lock threshold = value of passing under optimal stopping, with each game's miss chance; an unlocked starter scores 0 at week's end. "
-               "Scoring read from the league._"]
+               "lock threshold = value of passing under optimal stopping, with each game's miss chance; "
+               + ("an unlocked starter's last game counts at week's end. " if AUTO_LAST else "an unlocked starter scores 0 at week's end. ") + "Scoring read from the league._"]
     text = "\n".join(o)
     open(os.path.join(args.out, "brief.md"), "w").write(text)
     if not args.now:
+        # calls.json: every run's lock calls and win chance, for the weekly scorecard (--review)
+        cp_ = os.path.join(HERE, "calls.json")
+        CALLS = json.load(open(cp_)) if os.path.exists(cp_) else {}
+        keep = {(wk_start - dt.timedelta(days=7 * i)).isoformat() for i in range(6)}
+        CALLS = {k: v for k, v in CALLS.items() if k in keep}
+        CALLS.setdefault(wk_start.isoformat(), []).append(dict(
+            t=now.isoformat(timespec="minutes"),
+            calls=[dict(name=r["name"], score=r["score"], call=r["call"], threshold=r["threshold"], left=r["left"]) for r in lock_rows],
+            win=(max(wp["p_best"], wp["p_ev"]) if wp and not wp.get("missing") else None),
+            actions=[a for _, a in actions[:8]]))
+        json.dump(CALLS, open(cp_, "w"), indent=1)
         LJ["snapshots"] = snaps[-200:]
         LJ.setdefault("answers", answers)
         json.dump(LJ, open(lj_path, "w"), indent=1)

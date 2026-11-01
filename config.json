@@ -10,6 +10,7 @@
   "sd_ratio": 0.28,
   "close_call_fp": 2.0,
   "objective": "win",
+  "unlocked_rule": "last_game",
   "winprob_sims": 12000,
   "winprob_min_gain": 0.005,
   "winprob_max_open": 8,

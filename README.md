@@ -17,7 +17,7 @@ python3 brief.py --league                                     # every roster com
 python3 brief.py --trades                                     # 1-for-1 and 2-for-1 trades that help both sides
 python3 brief.py --selftest                                   # checks the lock math against a simulation
 ```
-Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from the Project next to `brief.py` before running.
+Python 3.9+, standard library only. Scheduled runs follow RUNBOOK.md. Copy `locks.json` and `overrides.json` from the Project next to `brief.py` before running.
 
 ## League facts
 - 16 teams, points scoring, Lock-in mode, matchup week Mon-Sun US Eastern (closes Mon ~18:00 NZ, ~17:00 NZ before NZ daylight saving starts).
@@ -49,6 +49,14 @@ Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from 
   the lock call says "only if he was starting" and "Do now" asks. Answers go in `lineup.json` as `"answers": {"<name>": {"<US date>": "start" | "bench"}}`.
   `lineup.json` is state like locks.json: keep it in the Project and copy it back after each run. Runs with `--now` don't add snapshots.
 - **Empty slots**: an open slot with nobody in it is a "Do now" action with the best fill, or a warning when nobody who fits has a game left.
+- **Unlocked starters** (`unlocked_rule`, default `"last_game"`): Sleeper takes his team's final game of the week if he's left unlocked, 0 if he didn't play
+  (Sleeper HQ, "Lock-In Mode Details", Feb 2026). `"zero"` is kept as an option. Only the warnings change; the lock math is the same.
+- **Opponent**: settings.json `opponent_total` is his banked (locked) total and `opponent_open` lists his still-unlocked starters, both keyed by the
+  Monday of the week: `{"opponent_total": {"2026-11-02": 120}, "opponent_open": {"2026-11-02": ["Tyrese Maxey"]}}` (`[]` = fully locked).
+  Open starters are simulated like mine and added to his total. Without `opponent_open` his total is treated as final and "Do now" asks.
+- **Calls log and scorecard**: every run appends its lock calls and win chance to `calls.json` (last 6 weeks; state like locks.json, keep it in the Project).
+  `python3 brief.py --review [<Monday>]` prints a week's scorecard (default last week): locked score vs best game of the week per player, the brief's call
+  on that score before it was locked, the opponent's total, the win chance given, and Sleeper's season points scored vs possible.
 - **Lineup**: locked starters and players whose game is live are frozen; the best layout of the open slots is found by assignment. Changes under 2 points are shown as optional.
 - **Free agents**: active, not rostered, 2+ games at 18+ minutes or last season 22+ FP/game. Gain = lineup value with him in place of one of the 4 weakest bench players.
   "waiver" = his team already played today, so the add is probably a waiver claim.
