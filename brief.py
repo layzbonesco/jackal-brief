@@ -24,6 +24,7 @@ def merge(base, over):
 if os.path.exists(os.path.join(HERE, "settings.json")):  # tuning dials kept in the Claude Project
     merge(CFG, json.load(open(os.path.join(HERE, "settings.json"))))
 ET, NZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Pacific/Auckland"), dt.timezone.utc
+BENCH_NOTE = " (only if he was starting when he played; bench games can't be locked)"  # until lineup snapshots exist (PRD v3 item B)
 SLEEPER, SLEEPER2 = "https://api.sleeper.app/v1/", "https://api.sleeper.com/"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
 TEAMMAP = CFG["espn_to_sleeper_team"]
@@ -435,11 +436,33 @@ def main():
     lp = os.path.join(HERE, "locks.json")
     LOCKS = (json.load(open(lp)) if os.path.exists(lp) else {}).get(wk_start.isoformat(), {})
     locked_pids = {pid for pid in starters if pid in me and me[pid]["name"] in LOCKS}
+    # A lock stays with the roster after the player is traded or dropped (Sleeper shows the slot as "0").
+    # Match those locks to their slot: Sleeper's matchup starters still name the player, else the slot in locks.json.
+    m_starters = mm.get("starters") or []
+    gone = {n: v for n, v in LOCKS.items() if n not in {me[p]["name"] for p in locked_pids}}
+    lock_slot = {}
+    for i, pid in enumerate(starters):
+        if pid in me:
+            continue
+        ms = m_starters[i] if i < len(m_starters) else None
+        hit = nm(ms) if ms and ms in P and nm(ms) in gone else None
+        if hit is None:
+            hit = next((n for n, v in gone.items() if v.get("slot") == slots[i] and n not in lock_slot.values()), None)
+        if hit:
+            lock_slot[i] = hit
+    unmatched = [n for n in gone if n not in lock_slot.values()]
+    banked = sum(float(v["score"]) for v in LOCKS.values())
 
     # lock calls
     lock_rows, actions = [], []
+    if unmatched:
+        actions.append(("0000", f"Check locks.json: {', '.join(unmatched)} locked but not found in your lineup (score still counted in banked)"))
     for i, pid in enumerate(starters):
         if pid not in me:
+            if i in lock_slot:
+                n_ = lock_slot[i]
+                lock_rows.append(dict(name=n_, score=float(LOCKS[n_]["score"]), sleeper=None, left=0, next_tip=None, threshold=None,
+                                      call="LOCKED", why="no longer on your roster; the lock still counts", avg=None))
             continue
         r = me[pid]
         if pid in locked_pids:
@@ -453,10 +476,10 @@ def main():
             if n_left == 0:
                 call, why = "LOCK", "no games left: unlocked scores 0"
                 actions.append((week_close.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ"),
-                                f"LOCK {r['name']} ({s:.1f}) now: no games left, unlocked = 0 (week closes {nz(week_close)} NZ)"))
+                                f"LOCK {r['name']} ({s:.1f}) now: no games left, unlocked = 0 (week closes {nz(week_close)} NZ)"+BENCH_NOTE))
             elif s >= pv:
                 call, why = "LOCK", f"beats value of passing ({pv:.1f})"
-                actions.append((r["next_utc"], f"LOCK {r['name']} ({s:.1f}) before his next tip ({r['next_tip']} NZ): passing is worth {pv:.1f}"))
+                actions.append((r["next_utc"], f"LOCK {r['name']} ({s:.1f}) before his next tip ({r['next_tip']} NZ): passing is worth {pv:.1f}"+BENCH_NOTE))
             else:
                 call, why = "PASS", f"passing is worth {pv:.1f}"
                 if pv - s < CFG["close_call_fp"]:
@@ -469,7 +492,7 @@ def main():
             actions.append(("0000", f"{r['name']} has no lockable game and no games left: 0 this week unless swapped (slot {slots[i]})"))
 
     # lineup: locked and live starters are frozen; live bench players can't come in
-    frozen = {i for i, pid in enumerate(starters) if pid in locked_pids or (pid in me and me[pid]["live"])}
+    frozen = {i for i, pid in enumerate(starters) if pid in locked_pids or i in lock_slot or (pid in me and me[pid]["live"])}
     open_slots = [i for i in range(len(slots)) if i not in frozen]
     cand = [pid for pid in me_ids if pid not in {starters[i] for i in frozen} and not (me[pid]["live"] and pid not in starters)]
     pool = [dict(pid=pid, pos=me[pid]["pos"], val=me[pid]["val"] if pid in starters else me[pid]["pass_value"]) for pid in cand]
@@ -482,10 +505,21 @@ def main():
     outs = sorted(cur_open - tgt_set, key=lambda p: me[p]["val"])
     changes = [dict(put=me[b]["name"], was=me[a]["name"], gain=me[b]["pass_value"] - me[a]["val"], tip=me[b]["next_tip"], utc=me[b]["next_utc"])
                for a, b in zip(outs, ins)]
+    # empty open slots: nobody to swap out, so the zip above misses them
+    empty = [i for i in open_slots if starters[i] not in me]
+    for b in ins[len(outs):]:
+        changes.append(dict(put=me[b]["name"], was="an empty slot", gain=me[b]["pass_value"], tip=me[b]["next_tip"], utc=me[b]["next_utc"]))
+    for i in empty:
+        fill = target.get(i)
+        if fill and me[fill]["games"]:
+            actions.append((me[fill]["next_utc"], f"{slots[i]} is EMPTY (scores 0): start {me[fill]['name']} there before his next tip ({me[fill]['next_tip']} NZ)"))
+        elif not fill or not me[fill]["games"]:
+            actions.append(("0000", f"{slots[i]} is EMPTY and nobody on your roster who fits has a game left: add a free agent with a game, or it scores 0"))
     moves = [f"{slots[i]} {me[target[i]]['name']}" for i in open_slots if target.get(i) and target[i] != starters[i]]
-    if opt_total - cur_total >= CFG["min_lineup_gain"] and changes:
-        first = min(c["utc"] for c in changes)
-        actions.append((first, "Start " + "; ".join(f"{c['put']} for {c['was']} (+{c['gain']:.1f})" for c in changes)
+    swaps = [c for c in changes if c["was"] != "an empty slot"]  # empty slots already have their own action
+    if opt_total - cur_total >= CFG["min_lineup_gain"] and swaps:
+        first = min(c["utc"] for c in swaps)
+        actions.append((first, "Start " + "; ".join(f"{c['put']} for {c['was']} (+{c['gain']:.1f})" for c in swaps)
                         + f" before {nz(first) if first != '9999' else 'next tip'} NZ"))
 
     # free agents
@@ -530,14 +564,14 @@ def main():
     elif opp_m:
         opp_name = owner[opp_m["roster_id"]]
         opp_total = float(ov_total)
-        fixed, entries = 0.0, []
+        fixed, entries = banked, []  # every lock in locks.json counts, even for players since traded or dropped
         for pid in starters:
             if pid not in me:
                 continue
             r = me[pid]
             n_left, lk = len(r["games"]), r["lock"]
             if pid in locked_pids:
-                fixed += LOCKS[r["name"]]["score"]
+                continue
             elif lk and n_left == 0:
                 fixed += lk["fp"]
             elif n_left:
@@ -669,7 +703,7 @@ def main():
         o += ["| Player | Latest game | Sleeper | Per-game avg | Games left | Next tip (NZ) | Lock if at least | Call |", "|---|---|---|---|---|---|---|---|"]
         for r in lock_rows:
             th = f"{r['threshold']:.1f}" if r["threshold"] is not None else "-"
-            o.append(f"| {r['name']} | {r['score']:.1f} | {r['sleeper'] if r['sleeper'] is not None else '-'} | {r['avg']:.1f} | {r['left']} | {r['next_tip'] or '-'} | {th} | **{r['call']}** ({r['why']}) |")
+            o.append(f"| {r['name']} | {r['score']:.1f} | {r['sleeper'] if r['sleeper'] is not None else '-'} | {'-' if r['avg'] is None else format(r['avg'], '.1f')} | {r['left']} | {r['next_tip'] or '-'} | {th} | **{r['call']}** ({r['why']}) |")
     else:
         o.append("No starter has a lockable game right now.")
     o += ["", f"## Lineup (open slots now worth {cur_total:.1f}; best {opt_total:.1f})",
@@ -677,7 +711,10 @@ def main():
     for i, (s, pid) in enumerate(zip(slots, starters)):
         r = me.get(pid)
         if not r:
-            o.append(f"| {s} | empty | | 0 | 0 | |")
+            if i in lock_slot:
+                o.append(f"| {s} | {lock_slot[i]} (traded/dropped) | | - | {float(LOCKS[lock_slot[i]]['score']):.1f} | locked |")
+            else:
+                o.append(f"| {s} | **EMPTY** | | 0 | 0 | |")
             continue
         v = LOCKS[r["name"]]["score"] if pid in locked_pids else r["val"]
         o.append(f"| {s} | {r['name']} | {r['inj']['sleeper'] or ''} | {'-' if pid in locked_pids else len(r['games'])} | {v:.1f} | {'locked' if pid in locked_pids else ('live' if r['live'] else '')} |")
@@ -724,6 +761,7 @@ def main():
             for n_, c in wp["calls"].items():
                 o.append(f"| {n_} | {'LOCK' if wp['ev'][n_] else 'PASS'} | **{'LOCK' if c else 'PASS'}**{'' if c == wp['ev'][n_] else ' (differs)'} |")
         o.append("- Uses your current starters; lineup swaps above are not simulated.")
+        o.append("- Assumes every starter's latest game is lockable. A game he played on the bench can't be locked, so check before trusting a high win chance.")
     if WARN:
         o += ["", "## Data warnings"] + [f"- {w}" for w in WARN]
     o += ["", f"_Model: per-game mean blends last season's FP/game (weight {CFG['prior_weight_games']} games) with this season's games; "
