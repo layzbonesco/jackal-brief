@@ -24,7 +24,7 @@ def merge(base, over):
 if os.path.exists(os.path.join(HERE, "settings.json")):  # tuning dials kept in the Claude Project
     merge(CFG, json.load(open(os.path.join(HERE, "settings.json"))))
 ET, NZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Pacific/Auckland"), dt.timezone.utc
-BENCH_NOTE = " (only if he was starting when he played; bench games can't be locked)"  # until lineup snapshots exist (PRD v3 item B)
+BENCH_NOTE = " (only if he was starting when he played; bench games can't be locked)"  # shown when lineup.json can't tell
 SLEEPER, SLEEPER2 = "https://api.sleeper.app/v1/", "https://api.sleeper.com/"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
 TEAMMAP = CFG["espn_to_sleeper_team"]
@@ -418,15 +418,52 @@ def main():
         pv = pass_value(mu, sd, dnps) if games else 0.0
         wk = [g for g in glog.get(pid, []) if g["date"] in wk_days]
         lockable = wk[-1] if (starter and wk and team not in live) else None
+        slot_seen, bench_game = None, None
+        if lockable:
+            slot_seen, why_seen = slot_status(pid, lockable)
+            if slot_seen == "bench":
+                lockable, bench_game = None, dict(wk[-1], why=why_seen)
         val = max(lockable["fp"], pv) if lockable else pv
         return dict(pid=pid, name=nm(pid), team=team, pos=P.get(pid, {}).get("fantasy_positions") or [],
                     mu=mu, sd=sd, gp=n, prior=pm, games=games, dnps=dnps, pass_value=pv, lock=lockable, val=val,
+                    slot_seen=slot_seen, bench_game=bench_game,
                     live=team in live, next_tip=nz(games[0]["start"]) if games else None,
                     next_utc=games[0]["start"] if games else "9999", inj=inj_info(pid))
+
+    # ---- lineup snapshots: only a game played in a starting slot can be locked, and Sleeper keeps no slot history,
+    # so every run records who was starting (and which teams were live). lineup.json lives in the Project.
+    lj_path = os.path.join(HERE, "lineup.json")
+    LJ = json.load(open(lj_path)) if os.path.exists(lj_path) else {}
+    snaps = [s for s in LJ.get("snapshots", []) if dt.datetime.fromisoformat(s["t"]) > now - dt.timedelta(days=9)]
+    answers = LJ.get("answers", {})  # Asher's answers: {"<name>": {"<US date>": "start" | "bench"}}
+
+    def slot_status(pid, g):
+        """'start', 'bench' or None (unknown) for the slot pid was in when he played game g, with a reason."""
+        a = answers.get(nm(pid), {}).get(g["date"])
+        if a in ("start", "bench"):
+            return a, "you said so"
+        ev = next((e for e in events if e["day"] == g["date"] and g.get("team") in e["teams"]), None)
+        if not ev:
+            return None, "game not found in the schedule"
+        t0 = tip(ev["start"])
+        seen = [(dt.datetime.fromisoformat(s["t"]), s) for s in snaps]
+        during = [s for t, s in seen if t >= t0 and g.get("team") in s.get("live", [])]
+        if during:  # slots can't change while his game is live, so this is certain
+            return ("start" if pid in during[0]["starters"] else "bench"), "snapshot taken during the game"
+        before = [s for t, s in seen if t < t0]
+        after = [s for t, s in seen if t >= t0 + dt.timedelta(hours=2)]
+        if before and after:
+            b, a_ = pid in before[-1]["starters"], pid in after[0]["starters"]
+            if b == a_:
+                return ("start" if b else "bench"), "same slot before and after the game"
+            return None, "moved between the snapshots before and after the game"
+        return None, "no snapshot from before the game"
 
     # ---- my roster
     reserve = set(mine.get("reserve") or [])
     starters = list(mine["starters"])
+    if not args.now:  # replays with --now must not add snapshots
+        snaps.append(dict(t=now.isoformat(), starters=[p for p in starters if p != "0"], live=sorted(live)))
     me_ids = [p for p in mine["players"] if p not in reserve and p in P]
     me = {pid: player(pid, starter=pid in starters) for pid in me_ids}
     ir = [player(pid) for pid in reserve if pid in P]
@@ -471,21 +508,29 @@ def main():
             continue
         n_left = len(r["games"])
         lk = r["lock"]
+        note = BENCH_NOTE if (lk and r["slot_seen"] is None) else ""
+        if r["bench_game"] and not r["live"]:
+            bg = r["bench_game"]
+            lock_rows.append(dict(name=r["name"], score=bg["fp"], sleeper=sl_pts.get(pid), left=n_left, next_tip=r["next_tip"], threshold=None,
+                                  call="CAN'T LOCK", why=f"played that game on the bench ({bg['why']})", avg=r["mu"]))
         if lk:
             s, pv = lk["fp"], r["pass_value"]
+            if note:
+                actions.append(("0001", f"Was {r['name']} in your starting lineup when he scored {s:.1f} ({lk['date']} US)? "
+                                        f"Bench games can't be locked. Tell Claude so lineup.json records it"))
             if n_left == 0:
                 call, why = "LOCK", "no games left: unlocked scores 0"
                 actions.append((week_close.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ"),
-                                f"LOCK {r['name']} ({s:.1f}) now: no games left, unlocked = 0 (week closes {nz(week_close)} NZ)"+BENCH_NOTE))
+                                f"LOCK {r['name']} ({s:.1f}) now: no games left, unlocked = 0 (week closes {nz(week_close)} NZ)"+note))
             elif s >= pv:
                 call, why = "LOCK", f"beats value of passing ({pv:.1f})"
-                actions.append((r["next_utc"], f"LOCK {r['name']} ({s:.1f}) before his next tip ({r['next_tip']} NZ): passing is worth {pv:.1f}"+BENCH_NOTE))
+                actions.append((r["next_utc"], f"LOCK {r['name']} ({s:.1f}) before his next tip ({r['next_tip']} NZ): passing is worth {pv:.1f}"+note))
             else:
                 call, why = "PASS", f"passing is worth {pv:.1f}"
                 if pv - s < CFG["close_call_fp"]:
                     why += " (close call)"
             lock_rows.append(dict(name=r["name"], score=s, sleeper=sl_pts.get(pid), left=n_left, next_tip=r["next_tip"],
-                                  threshold=pv, call=call, why=why, avg=r["mu"]))
+                                  threshold=pv, call=call, why=why + (" (slot unknown: only if he was starting)" if note else ""), avg=r["mu"]))
         elif n_left == 1 and not r["live"]:
             actions.append((r["next_utc"], f"{r['name']}: his {r['next_tip']} NZ game is his last this week; lock it once it finishes (unlocked = 0)"))
         elif n_left == 0 and not lk:
@@ -761,7 +806,9 @@ def main():
             for n_, c in wp["calls"].items():
                 o.append(f"| {n_} | {'LOCK' if wp['ev'][n_] else 'PASS'} | **{'LOCK' if c else 'PASS'}**{'' if c == wp['ev'][n_] else ' (differs)'} |")
         o.append("- Uses your current starters; lineup swaps above are not simulated.")
-        o.append("- Assumes every starter's latest game is lockable. A game he played on the bench can't be locked, so check before trusting a high win chance.")
+        unk = [r["name"] for r in me.values() if r["lock"] and r["slot_seen"] is None and r["pid"] in starters and r["pid"] not in locked_pids]
+        if unk:
+            o.append(f"- Assumes {', '.join(unk)} played his latest game in a starting slot (not known yet). If it was a bench game, this win chance is too high.")
     if WARN:
         o += ["", "## Data warnings"] + [f"- {w}" for w in WARN]
     o += ["", f"_Model: per-game mean blends last season's FP/game (weight {CFG['prior_weight_games']} games) with this season's games; "
@@ -769,6 +816,10 @@ def main():
                "Scoring read from the league._"]
     text = "\n".join(o)
     open(os.path.join(args.out, "brief.md"), "w").write(text)
+    if not args.now:
+        LJ["snapshots"] = snaps[-200:]
+        LJ.setdefault("answers", answers)
+        json.dump(LJ, open(lj_path, "w"), indent=1)
     json.dump(dict(week=week, now=now.isoformat(), actions=[a for _, a in actions], lock=lock_rows, changes=changes,
                    upgrades=ups[:8], trade=trade[:10], injuries=inj_rows, warnings=WARN),
               open(os.path.join(args.out, "brief.json"), "w"), indent=1, default=str)

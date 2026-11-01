@@ -42,6 +42,12 @@ Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from 
   Sleeper's matchup points can't be used: they add up each starter's latest game, not what was locked. Without it, win mode is off for the week
   (the lock calls use the points rule) and "Do now" says what to add.
   It uses your current starters; suggested lineup swaps are not simulated.
+- **Banked points** = every lock in locks.json for the week, including players since traded or dropped (the lock stays with your roster; the slot shows "traded/dropped").
+- **Bench games can't be locked.** Sleeper keeps no record of which slot a player was in, so every run appends a snapshot to `lineup.json` (who was starting, which teams were live; last 9 days).
+  A game counts as a starting-slot game if a snapshot was taken while it was live, or the snapshots just before and after it agree. Otherwise the slot is unknown:
+  the lock call says "only if he was starting" and "Do now" asks. Answers go in `lineup.json` as `"answers": {"<name>": {"<US date>": "start" | "bench"}}`.
+  `lineup.json` is state like locks.json: keep it in the Project and copy it back after each run. Runs with `--now` don't add snapshots.
+- **Empty slots**: an open slot with nobody in it is a "Do now" action with the best fill, or a warning when nobody who fits has a game left.
 - **Lineup**: locked starters and players whose game is live are frozen; the best layout of the open slots is found by assignment. Changes under 2 points are shown as optional.
 - **Free agents**: active, not rostered, 2+ games at 18+ minutes or last season 22+ FP/game. Gain = lineup value with him in place of one of the 4 weakest bench players.
   "waiver" = his team already played today, so the add is probably a waiver claim.
