@@ -41,7 +41,8 @@ Python 3.9+, standard library only. Copy `locks.json` and `overrides.json` from 
   The opponent's locked total must be set each week in settings.json as `"opponent_total": {"<Monday of the week>": <number>}`, e.g. `{"2026-10-26": 149}`.
   Sleeper's matchup points can't be used: they add up each starter's latest game, not what was locked. Without it, win mode is off for the week
   (the lock calls use the points rule) and "Do now" says what to add.
-  It uses your current starters; suggested lineup swaps are not simulated.
+  It also simulates the suggested lineup. When a lineup swap adds expected points but lowers the chance of beating the opponent (a long-shot week),
+  "Do now" says to keep the current lineup instead; when a swap raises the win chance enough it says so.
 - **Banked points** = every lock in locks.json for the week, including players since traded or dropped (the lock stays with your roster; the slot shows "traded/dropped").
 - **Bench games can't be locked.** Sleeper keeps no record of which slot a player was in, so every run appends a snapshot to `lineup.json` (who was starting, which teams were live; last 9 days).
   A game counts as a starting-slot game if a snapshot was taken while it was live, or the snapshots just before and after it agree. Otherwise the slot is unknown:

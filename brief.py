@@ -604,27 +604,49 @@ def main():
     if opp_m and ov_total is None:
         # Sleeper's matchup points are each starter's latest game added up, not what he locked, so they can't stand in for his total
         wp = dict(opp=owner[opp_m["roster_id"]], missing=True, sleeper_pts=float(opp_m.get("points") or 0))
-        actions.append(("0000", f"Win mode is off: add \"opponent_total\": {{\"{wk_start}\": <{wp['opp']}'s locked total>}} to settings.json "
-                                f"(Sleeper's {wp['sleeper_pts']:.1f} is his latest games, not his locks)"))
+        actions.append(("0000", f"Win mode is off: what is {wp['opp']}'s locked total right now? It goes in settings.json as "
+                                f"\"opponent_total\": {{\"{wk_start}\": <total>}} (Sleeper's {wp['sleeper_pts']:.1f} is his latest games, not his locks)"))
     elif opp_m:
         opp_name = owner[opp_m["roster_id"]]
         opp_total = float(ov_total)
-        fixed, entries = banked, []  # every lock in locks.json counts, even for players since traded or dropped
-        for pid in starters:
-            if pid not in me:
-                continue
-            r = me[pid]
-            n_left, lk = len(r["games"]), r["lock"]
-            if pid in locked_pids:
-                continue
-            elif lk and n_left == 0:
-                fixed += lk["fp"]
-            elif n_left:
-                entries.append(dict(name=r["name"], s0=lk["fp"] if lk else None, mu=r["mu"], sd=r["sd"], dnps=r["dnps"],
-                                    ev_lock=bool(lk and lk["fp"] >= r["pass_value"]), next_utc=r["next_utc"], next_tip=r["next_tip"]))
+        def week_setup(lineup):
+            """Banked points and open entries for a lineup (one pid per slot). Every lock in locks.json counts,
+            even for players since traded or dropped; a player moved in from the bench has no lockable game."""
+            fixed_, entries_ = banked, []
+            for pid in lineup:
+                if pid not in me or pid in locked_pids:
+                    continue
+                r = me[pid]
+                lk = r["lock"] if pid in starters else None
+                n_left = len(r["games"])
+                if lk and n_left == 0:
+                    fixed_ += lk["fp"]
+                elif n_left:
+                    entries_.append(dict(name=r["name"], s0=lk["fp"] if lk else None, mu=r["mu"], sd=r["sd"], dnps=r["dnps"],
+                                         ev_lock=bool(lk and lk["fp"] >= r["pass_value"]), next_utc=r["next_utc"], next_tip=r["next_tip"]))
+            return fixed_, entries_
+
+        fixed, entries = week_setup(starters)
         wp = win_probability(entries, fixed, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"],
                              max_open=CFG["winprob_max_open"])
-        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json", fixed=fixed, mine_now=mm.get("points") or 0.0)
+        # the same week on the suggested lineup (open slots filled as the lineup section recommends)
+        best_lu = [target.get(i, starters[i]) if i in open_slots else starters[i] for i in range(len(slots))]
+        wp_lineup = None
+        if best_lu != starters:
+            f2, e2 = week_setup(best_lu)
+            wl = win_probability(e2, f2, opp_total, n=CFG["winprob_sims"], min_gain=CFG["winprob_min_gain"], max_open=CFG["winprob_max_open"])
+            wp_lineup = dict(p=wl["p_best"], moves=moves)
+        wp.update(opp=opp_name, opp_total=opp_total, source="settings.json", fixed=fixed, mine_now=mm.get("points") or 0.0, lineup=wp_lineup)
+        if (CFG.get("objective") == "win" and wp_lineup and wp_lineup["p"] < max(wp["p_best"], wp["p_ev"]) - CFG["winprob_min_gain"]
+                and any(t.startswith("Start ") for _, t in actions)):
+            actions[:] = [x for x in actions if not x[1].startswith("Start ")]
+            actions.append(("0000", f"Keep your lineup: the points swap ({', '.join(wp_lineup['moves'])}) lowers win chance vs {opp_name} "
+                                    f"from {max(wp['p_best'], wp['p_ev']):.0%} to {wp_lineup['p']:.0%}"))
+        if (wp_lineup and wp_lineup["p"] - max(wp["p_best"], wp["p_ev"]) >= CFG["winprob_min_gain"]
+                and not any(t.startswith("Start ") for _, t in actions)):
+            actions.append((min(c["utc"] for c in changes) if changes else "0000",
+                            f"Lineup swap lifts win chance vs {opp_name} from {max(wp['p_best'], wp['p_ev']):.0%} to {wp_lineup['p']:.0%}: "
+                            + ", ".join(wp_lineup["moves"])))
         if CFG.get("objective") == "win":
             gain = wp["p_best"] - wp["p_ev"]
             for row in lock_rows:
@@ -765,6 +787,8 @@ def main():
         o.append(f"| {s} | {r['name']} | {r['inj']['sleeper'] or ''} | {'-' if pid in locked_pids else len(r['games'])} | {v:.1f} | {'locked' if pid in locked_pids else ('live' if r['live'] else '')} |")
     if changes:
         tag = "Suggested" if opt_total - cur_total >= CFG["min_lineup_gain"] else f"Marginal (under {CFG['min_lineup_gain']:.0f} pts, optional)"
+        if wp and wp.get("lineup") and wp["lineup"]["p"] < max(wp["p_best"], wp["p_ev"]) - CFG["winprob_min_gain"]:
+            tag += f" but it lowers your win chance ({max(wp['p_best'], wp['p_ev']):.0%} to {wp['lineup']['p']:.0%}), so keep the current lineup"
         o += ["", f"{tag}: " + "; ".join(f"start {c['put']} for {c['was']} (+{c['gain']:.1f})" for c in changes)]
         o.append("Slot layout after: " + ", ".join(moves))
     bench = [me[p] for p in me_ids if p not in starters]
@@ -805,7 +829,13 @@ def main():
             o += ["", "| Player | Points rule | Win-chance call |", "|---|---|---|"]
             for n_, c in wp["calls"].items():
                 o.append(f"| {n_} | {'LOCK' if wp['ev'][n_] else 'PASS'} | **{'LOCK' if c else 'PASS'}**{'' if c == wp['ev'][n_] else ' (differs)'} |")
-        o.append("- Uses your current starters; lineup swaps above are not simulated.")
+        if wp.get("lineup"):
+            cur_p = max(wp["p_best"], wp["p_ev"])
+            verdict = (" Keep your current lineup: the swap adds expected points but lowers the chance of winning."
+                       if wp["lineup"]["p"] < cur_p - CFG["winprob_min_gain"] else "")
+            o.append(f"- Suggested lineup ({', '.join(wp['lineup']['moves'])}): {wp['lineup']['p']:.1%} vs {cur_p:.1%} now.{verdict}")
+        else:
+            o.append("- Your current lineup is already the suggested one.")
         unk = [r["name"] for r in me.values() if r["lock"] and r["slot_seen"] is None and r["pid"] in starters and r["pid"] not in locked_pids]
         if unk:
             o.append(f"- Assumes {', '.join(unk)} played his latest game in a starting slot (not known yet). If it was a bench game, this win chance is too high.")
